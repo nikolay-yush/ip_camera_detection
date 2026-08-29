@@ -1,0 +1,42 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Event captures & saved snapshots
+events/
+*.jpg
+*.jpeg
+*.png
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# YOLO / Ultralytics model weights & downloads
+*.pt
+*.onnx
+*.engine
+
+# System files
+.DS_Store
+Thumbs.db
