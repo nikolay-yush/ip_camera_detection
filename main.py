@@ -1,130 +1,413 @@
-import cv2
+import os
+import sys
+
+from app.cleanup import init_cleanup, run_cleanup_if_needed
+from app.recorder import Recorder
+
+
+# ============================================================
+# RTSP / FFmpeg
+# ============================================================
+
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;udp|"
+    "fflags;nobuffer|"
+    "flags;low_delay|"
+    "max_delay;0"
+)
+
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
+
+# ============================================================
+# Silence native stderr
+# Must be before importing cv2
+# ============================================================
+
+try:
+    devnull = os.open(os.devnull, os.O_WRONLY)
+
+    os.dup2(
+        devnull,
+        sys.stderr.fileno(),
+    )
+
+    os.close(devnull)
+
+except Exception:
+    pass
+
+
+# ============================================================
+# Imports
+# ============================================================
+
+import threading
 import time
-import logging
+
+import cv2
+import numpy as np
 
 from ultralytics import YOLO
 
 from app.settings import settings
-from app.cleanup import init_cleanup, run_cleanup_if_needed
-from app.event_shot_manager import EventShotManager
 
 
-# Suppress YOLO verbose output
-logging.getLogger("ultralytics").setLevel(logging.ERROR)
+# ============================================================
+# Settings
+# ============================================================
 
-WINDOW_NAME = "IP Camera YOLO"
+MODEL_PATH = "yolov8n.pt"
 
-# Reconnection settings
-MAX_RECONNECT_ATTEMPTS = 5
-RECONNECT_DELAY_SECONDS = 60.0
+PERSON_CLASS = 0
 
-model = YOLO("yolov8n.pt")
-TARGET_CLASSES = [0]
+CONFIDENCE = 0.40
 
+YOLO_SIZE = 640
 
-def open_camera_stream(url: str) -> cv2.VideoCapture:
-    """Helper function to create a VideoCapture object."""
-    capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return capture
+YOLO_FPS = 8
+
+YOLO_INTERVAL = 1.0 / YOLO_FPS
 
 
-# Initial video stream connection
-cap = open_camera_stream(settings.RTSP_URL)
+# ============================================================
+# Utils
+# ============================================================
 
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+def is_recording_time() -> bool:
 
-# Timers and counters
-last_event_time = 0.0
-frame_counter = 0
-reconnect_attempts = 0
+    hour = time.localtime().tm_hour
 
-# Event and snapshot manager instance
-shot_mgr = EventShotManager()
-
-# Run initial directory cleanup before starting the loop
-last_cleanup_time = init_cleanup()
+    return 4 <= hour < 22
 
 
-# =========================
-# MAIN LOOP
-# =========================
-try:
+# ============================================================
+# Cleanup worker
+# ============================================================
+
+def cleanup_worker(last_cleanup_time: float):
+
     while True:
-        # Check if user closed the display window via (X) button
-        try:
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                break
-        except cv2.error:
-            break
 
-        ret, frame = cap.read()
-
-        # 🚨 Handle stream failure / disconnect with limited retries
-        if not ret:
-            reconnect_attempts += 1
-            print(
-                f"[Camera] Stream lost! Attempt {reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}."
-            )
-            cap.release()
-
-            if reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
-                print("[Camera] Maximum reconnect attempts reached. Exiting application...")
-                break
-
-            print(f"[Camera] Waiting {int(RECONNECT_DELAY_SECONDS)}s before reconnect attempt...")
-            time.sleep(RECONNECT_DELAY_SECONDS)
-
-            cap = open_camera_stream(settings.RTSP_URL)
-            continue
-
-        # Reset retry counter on successful frame capture
-        reconnect_attempts = 0
-        frame_counter += 1
-
-        # Run YOLO inference on every 2nd frame to reduce latency
-        if frame_counter % 2 != 0:
-            continue
-
-        frame = cv2.resize(frame, (960, 540))
-
-        results = model(
-            frame,
-            classes=TARGET_CLASSES,
-            conf=0.4,
-            verbose=False
+        last_cleanup_time = run_cleanup_if_needed(
+            last_cleanup_time
         )
 
-        annotated = results[0].plot()
-        detected = len(results[0].boxes) > 0
-        now = time.time()
+        time.sleep(3600)
 
-        # Handle active cooldown period between detection events
-        if now - last_event_time < settings.COOLDOWN_TIME:
-            cv2.imshow(WINDOW_NAME, annotated)
 
-            # ESC key to exit
-            if cv2.waitKey(1) & 0xFF == 27:
+# ============================================================
+# Camera
+# ============================================================
+
+class Camera:
+
+    def __init__(self, url: str):
+
+        self.running = True
+
+        self.lock = threading.Lock()
+        self.frame = None
+
+        self.cap = cv2.VideoCapture(
+            url,
+            cv2.CAP_FFMPEG,
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_BUFFERSIZE,
+            1,
+        )
+
+        self.thread = threading.Thread(
+            target=self._read,
+            daemon=True,
+            name="rtsp-reader",
+        )
+
+        self.thread.start()
+
+    def _read(self):
+
+        while self.running:
+
+            ok, frame = self.cap.read() # type: ignore
+
+            if not self.running:
                 break
-            continue
 
-        # Periodically check and clean up old event snapshots
-        last_cleanup_time = run_cleanup_if_needed(last_cleanup_time)
+            if not ok:
+                continue
 
-        # Process detection lifecycle and handle image saving
-        event_just_ended = shot_mgr.process_event(detected, annotated)
-        if event_just_ended:
-            last_event_time = now
+            with self.lock:
+                self.frame = frame
 
-        cv2.imshow(WINDOW_NAME, annotated)
+    def get_frame(self):
 
-        # ESC key to exit
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+        with self.lock:
 
-finally:
-    # Guaranteed cleanup of resources on application exit
-    print("Releasing camera stream and destroying windows...")
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Shutdown complete.")
+            if self.frame is None:
+                return None
+
+            return self.frame.copy()
+
+    def stop(self):
+
+        self.running = False
+
+        self.thread.join(timeout=0.5)
+
+        if not self.thread.is_alive():
+
+            if self.cap is not None:
+                self.cap.release()
+
+            self.cap = None
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    # ========================================================
+    # Cleanup
+    # ========================================================
+
+    print("Init cleanup...")
+
+    last_cleanup_time = init_cleanup()
+
+    cleanup_thread = threading.Thread(
+        target=cleanup_worker,
+        args=(last_cleanup_time,),
+        daemon=True,
+        name="cleanup-worker",
+    )
+
+    cleanup_thread.start()
+
+    # ========================================================
+    # YOLO
+    # ========================================================
+
+    print("Loading YOLOv8n...")
+
+    model = YOLO(MODEL_PATH)
+
+    # --------------------------------------------------------
+    # Warmup
+    # --------------------------------------------------------
+
+    print("Warming up...")
+
+    dummy = np.zeros(
+        (YOLO_SIZE, YOLO_SIZE, 3),
+        dtype=np.uint8,
+    )
+
+    model.predict(
+        dummy,
+        classes=[PERSON_CLASS],
+        conf=CONFIDENCE,
+        imgsz=YOLO_SIZE,
+        device="cpu",
+        verbose=False,
+    )
+
+    print("YOLO ready")
+
+    # ========================================================
+    # Window
+    # ========================================================
+
+    window_name = (
+        "YCC365 YOLO"
+        f" | {settings.RTSP_URL}"
+    )
+
+    cv2.namedWindow(
+        window_name,
+        cv2.WINDOW_NORMAL,
+    )
+
+    # ========================================================
+    # Camera
+    # ========================================================
+
+    print("Connecting camera...")
+
+    camera = Camera(
+        settings.RTSP_URL
+    )
+
+    print("Camera started")
+
+    # ========================================================
+    # Recorder
+    # ========================================================
+
+    recorder = Recorder(
+        camera
+    )
+
+    recorder.start()
+
+    recorder.set_enabled(
+        is_recording_time()
+    )
+
+    print("Recorder started")
+
+    print(
+        "Recording schedule: "
+        "04:00 - 22:00"
+    )
+
+    print(
+        "Press Q / ESC or close the window to exit"
+    )
+
+    # ========================================================
+    # YOLO state
+    # ========================================================
+
+    last_inference = 0.0
+    last_result = None
+
+    try:
+
+        while True:
+
+            # =================================================
+            # Always get latest frame
+            # =================================================
+
+            frame = camera.get_frame()
+
+            if frame is None:
+                continue
+
+            # =================================================
+            # Recorder schedule
+            # =================================================
+
+            recorder.set_enabled(
+                is_recording_time()
+            )
+
+            now = time.monotonic()
+
+            # =================================================
+            # YOLO
+            # =================================================
+
+            if now - last_inference >= YOLO_INTERVAL:
+
+                last_inference = now
+
+                last_result = model.predict(
+                    frame,
+                    classes=[PERSON_CLASS],
+                    conf=CONFIDENCE,
+                    imgsz=YOLO_SIZE,
+                    device="cpu",
+                    verbose=False,
+                )[0]
+
+                if len(last_result.boxes) > 0: # type: ignore
+
+                    print(
+                        f"PERSON: {len(last_result.boxes)}" # type: ignore
+                    )
+
+            # =================================================
+            # Draw latest YOLO result
+            # on CURRENT camera frame
+            # =================================================
+
+            if last_result is not None:
+
+                display = last_result.plot(
+                    img=frame,
+                )
+
+            else:
+
+                display = frame
+
+            # =================================================
+            # Display
+            # =================================================
+
+            cv2.imshow(
+                window_name,
+                display,
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q") or key == 27:
+                break
+
+            # =================================================
+            # Window close
+            # =================================================
+
+            try:
+
+                visible = cv2.getWindowProperty(
+                    window_name,
+                    cv2.WND_PROP_VISIBLE,
+                )
+
+                if visible < 1:
+                    break
+
+            except cv2.error:
+
+                break
+
+    except KeyboardInterrupt:
+
+        pass
+
+    finally:
+
+        print("Stopping...")
+
+        # ----------------------------------------------------
+        # Stop recorder first
+        # ----------------------------------------------------
+
+        try:
+            recorder.stop()
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Stop camera
+        # ----------------------------------------------------
+
+        try:
+            camera.stop()
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Close GUI
+        # ----------------------------------------------------
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+        print("Stopped")
+
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
