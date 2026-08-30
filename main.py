@@ -3,6 +3,7 @@ import sys
 
 from app.cleanup import init_cleanup, run_cleanup_if_needed
 from app.recorder import Recorder
+from app.event_manager import EventManager
 
 
 # ============================================================
@@ -68,6 +69,8 @@ YOLO_SIZE = 640
 YOLO_FPS = 8
 
 YOLO_INTERVAL = 1.0 / YOLO_FPS
+
+EVENT_COOLDOWN = 60
 
 
 # ============================================================
@@ -170,6 +173,7 @@ class Camera:
 # ============================================================
 
 def main():
+    last_event_time = 0.0
 
     # ========================================================
     # Cleanup
@@ -245,6 +249,11 @@ def main():
     print("Camera started")
 
     # ========================================================
+    # Event manager
+    # ========================================================
+    event_manager = EventManager()
+
+    # ========================================================
     # Recorder
     # ========================================================
 
@@ -316,11 +325,18 @@ def main():
                     verbose=False,
                 )[0]
 
+                # Person detected
                 if len(last_result.boxes) > 0: # type: ignore
 
-                    print(
-                        f"PERSON: {len(last_result.boxes)}" # type: ignore
-                    )
+                    now = time.monotonic()
+
+                    if now - last_event_time >= EVENT_COOLDOWN:
+
+                        last_event_time = now
+
+                        event_manager.handle_detection(
+                            frame
+                        )
 
             # =================================================
             # Draw latest YOLO result
@@ -383,6 +399,15 @@ def main():
 
         try:
             recorder.stop()
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Stop event manager
+        # ----------------------------------------------------
+
+        try:
+            event_manager.stop()
         except Exception:
             pass
 
