@@ -1,6 +1,7 @@
 import os
 import sys
 
+from app.settings import settings
 from app.cleanup import init_cleanup, run_cleanup_if_needed
 from app.recorder import Recorder
 from app.event_manager import EventManager
@@ -39,10 +40,6 @@ except Exception:
     pass
 
 
-# ============================================================
-# Imports
-# ============================================================
-
 import threading
 import time
 
@@ -54,24 +51,6 @@ from ultralytics import YOLO
 from app.settings import settings
 
 
-# ============================================================
-# Settings
-# ============================================================
-
-MODEL_PATH = "yolov8n.pt"
-
-PERSON_CLASS = 0
-
-CONFIDENCE = 0.40
-
-YOLO_SIZE = 640
-
-YOLO_FPS = 8
-
-YOLO_INTERVAL = 1.0 / YOLO_FPS
-
-EVENT_COOLDOWN = 60
-
 
 # ============================================================
 # Utils
@@ -81,7 +60,7 @@ def is_recording_time() -> bool:
 
     hour = time.localtime().tm_hour
 
-    return 4 <= hour < 22
+    return settings.RECORDING_START_HOUR <= hour < settings.RECORDING_END_HOUR
 
 
 # ============================================================
@@ -198,7 +177,7 @@ def main():
 
     print("Loading YOLOv8n...")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(settings.YOLO_MODEL_PATH)
 
     # --------------------------------------------------------
     # Warmup
@@ -207,15 +186,15 @@ def main():
     print("Warming up...")
 
     dummy = np.zeros(
-        (YOLO_SIZE, YOLO_SIZE, 3),
+        (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE, 3),
         dtype=np.uint8,
     )
 
     model.predict(
         dummy,
-        classes=[PERSON_CLASS],
-        conf=CONFIDENCE,
-        imgsz=YOLO_SIZE,
+        classes=settings.YOLO_PERSON_CLASS_IDS,
+        conf=settings.YOLO_CONFIDENCE,
+        imgsz=settings.YOLO_FRAME_SIZE,
         device="cpu",
         verbose=False,
     )
@@ -270,8 +249,8 @@ def main():
     print("Recorder started")
 
     print(
-        "Recording schedule: "
-        "04:00 - 22:00"
+        f"Recording schedule: "
+        "{settings.RECORDING_START_HOUR}:00 - {settings.RECORDING_END_HOUR}:00"
     )
 
     print(
@@ -312,15 +291,15 @@ def main():
             # YOLO
             # =================================================
 
-            if now - last_inference >= YOLO_INTERVAL:
+            if now - last_inference >= settings.YOLO_FRAME_INTERVAL:
 
                 last_inference = now
 
                 last_result = model.predict(
                     frame,
-                    classes=[PERSON_CLASS],
-                    conf=CONFIDENCE,
-                    imgsz=YOLO_SIZE,
+                    classes=settings.YOLO_PERSON_CLASS_IDS,
+                    conf=settings.YOLO_CONFIDENCE,
+                    imgsz=settings.YOLO_FRAME_SIZE,
                     device="cpu",
                     verbose=False,
                 )[0]
@@ -330,7 +309,7 @@ def main():
 
                     now = time.monotonic()
 
-                    if now - last_event_time >= EVENT_COOLDOWN:
+                    if now - last_event_time >= settings.EVENT_COOLDOWN:
 
                         last_event_time = now
 
