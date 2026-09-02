@@ -1,10 +1,20 @@
 import os
 import sys
+import threading
+import time
+import cv2
+import numpy as np
 
+from ultralytics import YOLO
 from app.settings import settings
-from app.cleanup import init_cleanup, run_cleanup_if_needed
+from app.camera import Camera
+from app.cleanup import init_cleanup
 from app.recorder import Recorder
 from app.event_manager import EventManager
+
+from app.utils.is_recording_time import is_recording_time
+from app.utils.cleanup_worker import cleanup_worker
+from app.utils.system_monitor_worker import system_monitor_worker
 
 
 # ============================================================
@@ -40,118 +50,24 @@ except Exception:
     pass
 
 
-import threading
-import time
-
-import cv2
-import numpy as np
-
-from ultralytics import YOLO
-
-from app.settings import settings
-
-
-
-# ============================================================
-# Utils
-# ============================================================
-
-def is_recording_time() -> bool:
-
-    hour = time.localtime().tm_hour
-
-    return settings.RECORDING_START_HOUR <= hour < settings.RECORDING_END_HOUR
-
-
-# ============================================================
-# Cleanup worker
-# ============================================================
-
-def cleanup_worker(last_cleanup_time: float):
-
-    while True:
-
-        last_cleanup_time = run_cleanup_if_needed(
-            last_cleanup_time
-        )
-
-        time.sleep(3600)
-
-
-# ============================================================
-# Camera
-# ============================================================
-
-class Camera:
-
-    def __init__(self, url: str):
-
-        self.running = True
-
-        self.lock = threading.Lock()
-        self.frame = None
-
-        self.cap = cv2.VideoCapture(
-            url,
-            cv2.CAP_FFMPEG,
-        )
-
-        self.cap.set(
-            cv2.CAP_PROP_BUFFERSIZE,
-            1,
-        )
-
-        self.thread = threading.Thread(
-            target=self._read,
-            daemon=True,
-            name="rtsp-reader",
-        )
-
-        self.thread.start()
-
-    def _read(self):
-
-        while self.running:
-
-            ok, frame = self.cap.read() # type: ignore
-
-            if not self.running:
-                break
-
-            if not ok:
-                continue
-
-            with self.lock:
-                self.frame = frame
-
-    def get_frame(self):
-
-        with self.lock:
-
-            if self.frame is None:
-                return None
-
-            return self.frame.copy()
-
-    def stop(self):
-
-        self.running = False
-
-        self.thread.join(timeout=0.5)
-
-        if not self.thread.is_alive():
-
-            if self.cap is not None:
-                self.cap.release()
-
-            self.cap = None
-
-
 # ============================================================
 # Main
 # ============================================================
 
 def main():
+    # ========================================================
+    # Start System Resource Monitor
+    # ========================================================
+    # monitor_thread = threading.Thread(
+    #     target=system_monitor_worker,
+    #     args=(5.0,),  # 5s interval
+    #     daemon=True,
+    #     name="system-monitor",
+    # )
+    # monitor_thread.start()
+
+    # print("System resource monitor started (5s interval)")
+
     last_event_time = 0.0
 
     # ========================================================
@@ -249,8 +165,7 @@ def main():
     print("Recorder started")
 
     print(
-        f"Recording schedule: "
-        "{settings.RECORDING_START_HOUR}:00 - {settings.RECORDING_END_HOUR}:00"
+        f"Recording schedule: {settings.RECORDING_START_HOUR}:00 - {settings.RECORDING_END_HOUR}:00"
     )
 
     print(
@@ -313,8 +228,10 @@ def main():
 
                         last_event_time = now
 
+                        annotated_frame = last_result.plot(img=frame.copy())
+
                         event_manager.handle_detection(
-                            frame
+                            frame=annotated_frame
                         )
 
             # =================================================

@@ -9,7 +9,7 @@ from app.settings import settings
 
 class Recorder:
 
-    def __init__(self, camera):
+    def __init__(self, camera, target_fps: float = 12.0):
 
         self.camera = camera
 
@@ -20,6 +20,11 @@ class Recorder:
 
         self.current_date = None
         self.current_hour = None
+
+        # Frame rate limit matching source camera stream (12 FPS)
+        self.target_fps = target_fps
+        self.frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0833
+        self.last_write_time = 0.0
 
         self.thread = threading.Thread(
             target=self._run,
@@ -55,49 +60,59 @@ class Recorder:
             now.date()
         )
 
-        filename = f"{now.strftime('%H')}-00.mp4"
+        filename = f"{now.strftime('%H')}-00.mkv"
 
         video_path = event_dir / filename
 
         height, width = frame.shape[:2]
 
-        fourcc = cv2.VideoWriter_fourcc(  # type: ignore
-            *"mp4v"
-        )
+        # Universal system codecs for Linux/OpenCV compatibility
+        codecs_to_try = ["avc1", "H264", "XVID", "mp4v"]
+        self.writer = None
 
-        self.writer = cv2.VideoWriter(
-            str(video_path),
-            fourcc,
-            20.0,
-            (width, height),
-        )
+        for codec in codecs_to_try:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)  # type: ignore
+                writer = cv2.VideoWriter(
+                    str(video_path),
+                    fourcc,
+                    self.target_fps,
+                    (width, height),
+                )
 
-        if not self.writer.isOpened():
+                if writer.isOpened():
+                    self.writer = writer
+                    print(
+                        f"[Recorder] Recording started ({self.target_fps} FPS, codec: {codec}): "
+                        f"{video_path}"
+                    )
+                    break
+            except Exception:
+                continue
 
-            self.writer = None
-
+        if self.writer is None:
             print(
-                f"[Recorder] Failed to open: "
+                f"[Recorder] Failed to open video writer for: "
                 f"{video_path}"
             )
-
             return
 
         self.current_date = now.date()
         self.current_hour = now.hour
 
-        print(
-            f"[Recorder] Recording: "
-            f"{video_path}"
-        )
-
     def _release_writer(self):
 
         if self.writer is not None:
+            try:
+                self.writer.release()
+                print("[Recorder] Video writer released safely.")
+            except Exception as exc:
+                print(f"[Recorder] Error releasing writer: {exc}")
+            finally:
+                self.writer = None
 
-            self.writer.release()
-
-            self.writer = None
+            self.current_date = None
+            self.current_hour = None
 
     def _run(self):
 
@@ -127,6 +142,15 @@ class Recorder:
 
                 continue
 
+            now_mono = time.monotonic()
+
+            # Enforce exact frame interval
+            if now_mono - self.last_write_time < self.frame_interval:
+                time.sleep(0.005)
+                continue
+
+            self.last_write_time = now_mono
+
             now = datetime.now()
 
             # =============================================
@@ -146,15 +170,20 @@ class Recorder:
                     now,
                 )
 
+                # Pause briefly if failed to create writer to prevent log spam
+                if self.writer is None:
+                    time.sleep(2.0)
+                    continue
+
             # =============================================
             # Write frame
             # =============================================
 
             if self.writer is not None:
-
-                self.writer.write(frame)
-
-            time.sleep(0.01)
+                try:
+                    self.writer.write(frame)
+                except Exception as exc:
+                    print(f"[Recorder] Error writing frame: {exc}")
 
         self._release_writer()
 
@@ -167,4 +196,3 @@ class Recorder:
         )
 
         self._release_writer()
-

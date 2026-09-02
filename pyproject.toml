@@ -8,6 +8,7 @@ dependencies = [
     "graphviz>=0.21",
     "opencv-python>=4.13.0.92",
     "plyer>=2.1.0",
+    "psutil>=7.2.2",
     "pydantic-settings>=2.15.0",
     "requests>=2.34.2",
     "ultralytics>=8.4.75",
