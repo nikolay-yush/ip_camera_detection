@@ -1,21 +1,19 @@
 import os
+import signal
 import sys
 import threading
 import time
 import cv2
 import numpy as np
-
 from ultralytics import YOLO
-from app.settings import settings
+
 from app.camera import Camera
 from app.cleanup import init_cleanup
-from app.recorder import Recorder
 from app.event_manager import EventManager
-
-from app.utils.is_recording_time import is_recording_time
+from app.ffmpeg_recorder import NativeFFmpegRecorder
+from app.settings import settings
 from app.utils.cleanup_worker import cleanup_worker
-from app.utils.system_monitor_worker import system_monitor_worker
-
+from app.utils.is_recording_time import is_recording_time
 
 # ============================================================
 # RTSP / FFmpeg
@@ -55,20 +53,26 @@ except Exception:
 # ============================================================
 
 def main():
-    # ========================================================
-    # Start System Resource Monitor
-    # ========================================================
-    # monitor_thread = threading.Thread(
-    #     target=system_monitor_worker,
-    #     args=(5.0,),  # 5s interval
-    #     daemon=True,
-    #     name="system-monitor",
-    # )
-    # monitor_thread.start()
 
-    # print("System resource monitor started (5s interval)")
+    # ========================================================
+    # Recorder FFmpeg
+    # ========================================================
+
+    recorders = [
+        NativeFFmpegRecorder("cam_1_front", settings.RTSP_URL),
+    ]
+
+    def shutdown(sig, frame):
+        print("\n[System] Stopping all recorders...")
+        for rec in recorders:
+            rec.stop_recording()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
     last_event_time = 0.0
+    last_schedule_check = 0.0
 
     # ========================================================
     # Cleanup
@@ -146,23 +150,8 @@ def main():
     # ========================================================
     # Event manager
     # ========================================================
+
     event_manager = EventManager()
-
-    # ========================================================
-    # Recorder
-    # ========================================================
-
-    recorder = Recorder(
-        camera
-    )
-
-    recorder.start()
-
-    recorder.set_enabled(
-        is_recording_time()
-    )
-
-    print("Recorder started")
 
     print(
         f"Recording schedule: {settings.RECORDING_START_HOUR}:00 - {settings.RECORDING_END_HOUR}:00"
@@ -190,17 +179,28 @@ def main():
             frame = camera.get_frame()
 
             if frame is None:
+                time.sleep(0.002)
                 continue
 
-            # =================================================
-            # Recorder schedule
-            # =================================================
-
-            recorder.set_enabled(
-                is_recording_time()
-            )
-
             now = time.monotonic()
+
+            # =================================================
+            # Recorder schedule (checked every 2 seconds)
+            # =================================================
+
+            if now - last_schedule_check >= 2.0:
+                last_schedule_check = now
+
+                if is_recording_time():
+                    for rec in recorders:
+                        if not rec.is_recording():
+                            print(f"[Recorder:{rec.camera_id}] Starting recording...")
+                            rec.start_recording()
+                else:
+                    for rec in recorders:
+                        if rec.is_recording():
+                            print(f"[Recorder:{rec.camera_id}] Stopping recording...")
+                            rec.stop_recording()
 
             # =================================================
             # YOLO
@@ -220,9 +220,7 @@ def main():
                 )[0]
 
                 # Person detected
-                if len(last_result.boxes) > 0: # type: ignore
-
-                    now = time.monotonic()
+                if len(last_result.boxes) > 0:  # type: ignore
 
                     if now - last_event_time >= settings.EVENT_COOLDOWN:
 
@@ -231,22 +229,17 @@ def main():
                         annotated_frame = last_result.plot(img=frame.copy())
 
                         event_manager.handle_detection(
+                            camera_id="cam_1_front",
                             frame=annotated_frame
                         )
 
             # =================================================
-            # Draw latest YOLO result
-            # on CURRENT camera frame
+            # Draw latest YOLO result on CURRENT camera frame
             # =================================================
 
             if last_result is not None:
-
-                display = last_result.plot(
-                    img=frame,
-                )
-
+                display = last_result.plot(img=frame)
             else:
-
                 display = frame
 
             # =================================================
@@ -290,13 +283,14 @@ def main():
         print("Stopping...")
 
         # ----------------------------------------------------
-        # Stop recorder first
+        # Stop native FFmpeg recorders
         # ----------------------------------------------------
 
-        try:
-            recorder.stop()
-        except Exception:
-            pass
+        for rec in recorders:
+            try:
+                rec.stop_recording()
+            except Exception:
+                pass
 
         # ----------------------------------------------------
         # Stop event manager

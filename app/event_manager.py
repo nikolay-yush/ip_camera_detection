@@ -13,9 +13,7 @@ from app.telegram_bot import send_detection
 class EventManager:
 
     def __init__(self):
-
         self.queue = Queue()
-
         self.running = True
 
         self.thread = threading.Thread(
@@ -23,53 +21,41 @@ class EventManager:
             daemon=True,
             name="event-worker",
         )
-
         self.thread.start()
 
-    def handle_detection(self, frame) -> None:
-
-        self.queue.put(
-            frame.copy()
-        )
+    def handle_detection(self, camera_id: str, frame) -> None:
+        """Receives camera_id directly from main.py and enqueues the frame."""
+        self.queue.put((camera_id, frame.copy()))
 
     def _worker(self):
-
         while self.running:
-
             try:
-
-                frame = self.queue.get(
-                    timeout=1
-                )
-
+                camera_id, frame = self.queue.get(timeout=1)
             except Empty:
-
                 continue
 
             try:
-                # events are handled here
-                screenshot_path = (self._save_screenshot(frame))
+                screenshot_path = self._save_screenshot(camera_id, frame)
                 play_sound()
-                send_detection(screenshot_path)
+                
+                # Pass camera_id to Telegram notification
+                send_detection(screenshot_path, camera_id=camera_id) # type: ignore
 
             except Exception as exc:
-
-                print(
-                    f"[EventManager] "
-                    f"Event error: {exc}"
-                )
+                print(f"[EventManager] Event error: {exc}")
 
             finally:
 
                 self.queue.task_done()
 
-    def _save_screenshot(self, frame) -> Path:
-
+    def _save_screenshot(self, camera_id: str, frame) -> Path:
         now = datetime.now()
 
+        # New structure: EVENTS_DIR / YYYY-MM-DD / camera_id /
         event_dir = (
             settings.EVENTS_DIR
             / now.strftime("%Y-%m-%d")
+            / camera_id
         )
 
         event_dir.mkdir(
@@ -88,24 +74,12 @@ class EventManager:
         )
 
         if not ok:
+            raise RuntimeError(f"Failed to save screenshot: {screenshot_path}")
 
-            raise RuntimeError(
-                f"Failed to save screenshot: "
-                f"{screenshot_path}"
-            )
-
-        print(
-            f"[EventManager] "
-            f"Screenshot saved: "
-            f"{screenshot_path}"
-        )
+        print(f"[EventManager] Screenshot saved: {screenshot_path}")
 
         return screenshot_path
 
     def stop(self):
-
         self.running = False
-
-        self.thread.join(
-            timeout=2
-        )
+        self.thread.join(timeout=2)
