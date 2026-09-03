@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+from typing import Any, Dict
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,7 +13,7 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-    RTSP_URL: str = ""
+    CAMERAS: Dict[str, Dict[str, Any]] = {}
     
     CLEANUP_DAYS: int = 2
 
@@ -18,6 +21,7 @@ class Settings(BaseSettings):
     CHAT_IDS: list[str] = []
 
     YOLO_MODEL_PATH: Path = Path("yolov8n.pt")
+    YOLO_DEVICE: str = "cpu"
     YOLO_PERSON_CLASS_IDS: list[int] = [0]
     YOLO_CONFIDENCE: float = 0.5
     YOLO_FRAME_SIZE: int = 640
@@ -33,5 +37,17 @@ class Settings(BaseSettings):
     def YOLO_FRAME_INTERVAL(self) -> float:
         return 1.0 / self.YOLO_FPS if self.YOLO_FPS > 0 else 0.0
 
+    @field_validator("CAMERAS", mode="before")
+    @classmethod
+    def parse_cameras_json(cls, value: Any) -> Dict[str, Dict[str, Any]]:
+        """Parses the CAMERAS JSON string from .env into a Python dictionary."""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON string in CAMERAS environment variable: {exc}"
+                )
+        return value
 
 settings = Settings()

@@ -45,14 +45,16 @@ def send_photo(
 
 def send_detection(
     photo_path: Path,
+    camera_id: str = "Unknown",
 ) -> bool:
 
     now = datetime.now()
 
     caption = (
-        "🚨 Human detected\n\n"
-        f"📅 {now:%Y-%m-%d}\n"
-        f"🕒 {now:%H:%M:%S}"
+        "🚨 **Human detected**\n\n"
+        f"📹 **Camera:** {camera_id}\n"
+        f"📅 **Date:** {now:%Y-%m-%d}\n"
+        f"🕒 **Time:** {now:%H:%M:%S}"
     )
 
     return send_photo(

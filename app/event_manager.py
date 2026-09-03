@@ -24,7 +24,7 @@ class EventManager:
         self.thread.start()
 
     def handle_detection(self, camera_id: str, frame) -> None:
-        """Receives camera_id directly from main.py and enqueues the frame."""
+        """Receives camera_id directly from main loop and enqueues the frame."""
         self.queue.put((camera_id, frame.copy()))
 
     def _worker(self):
@@ -35,23 +35,29 @@ class EventManager:
                 continue
 
             try:
+                # 1. Save screenshot to structured directory
                 screenshot_path = self._save_screenshot(camera_id, frame)
-                play_sound()
                 
-                # Pass camera_id to Telegram notification
-                send_detection(screenshot_path, camera_id=camera_id) # type: ignore
+                # 2. Local audio notification
+                play_sound()
+
+                # 3. Get user-friendly camera name if present in settings, fallback to ID
+                camera_info = settings.CAMERAS.get(camera_id, {})
+                camera_name = camera_info.get("name", camera_id)
+
+                # 4. Dispatch Telegram notification
+                send_detection(screenshot_path, camera_id=camera_name) # type: ignore
 
             except Exception as exc:
                 print(f"[EventManager] Event error: {exc}")
 
             finally:
-
                 self.queue.task_done()
 
     def _save_screenshot(self, camera_id: str, frame) -> Path:
         now = datetime.now()
 
-        # New structure: EVENTS_DIR / YYYY-MM-DD / camera_id /
+        # Structure: EVENTS_DIR / YYYY-MM-DD / camera_id /
         event_dir = (
             settings.EVENTS_DIR
             / now.strftime("%Y-%m-%d")
