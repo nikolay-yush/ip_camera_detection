@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime
+import time
 
 import requests
 
@@ -39,6 +40,8 @@ def send_photo(
                 f"Failed to send photo "
                 f"to {chat_id}: {exc}"
             )
+            
+        time.sleep(0.5)
 
     return True
 
