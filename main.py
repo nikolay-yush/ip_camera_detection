@@ -36,7 +36,7 @@ silence_c_libraries()  # Suppress C-level stderr logs from FFmpeg/OpenCV
 
 
 # ============================================================
-# Main Application
+# Main Application Entry Point
 # ============================================================
 
 def main():
@@ -45,21 +45,21 @@ def main():
     cameras: dict[str, Camera] = {}
     recorders: dict[str, NativeFFmpegRecorder] = {}
 
-    # Cache latest YOLO annotated frames for display rendering
+    # Cache latest YOLO annotated frames for rendering in GUI windows
     latest_frames: dict[str, np.ndarray] = {}
 
-    # Timers for background health checks
+    # Timers for periodic health checks
     last_schedule_check = 0.0
 
     # Placeholders for multiprocessing components
     yolo_process: mp.Process | None = None
     yolo_input_queue: mp.Queue | None = None
     yolo_output_queue: mp.Queue | None = None
-    yolo_stop_event: mp.Event | None = None  # type: ignore
+    yolo_stop_event: mp.Event | None = None # type: ignore
     shm_buffer: SharedMemoryRingBuffer | None = None
 
     # --------------------------------------------------------
-    # 0. Shutdown Signal Handler
+    # 0. Shutdown Signal Handling
     # --------------------------------------------------------
     def shutdown(sig, frame):
         print("\n[System] Shutdown signal received. Triggering exit...", flush=True)
@@ -92,7 +92,7 @@ def main():
                 recorders[cid] = NativeFFmpegRecorder(cid, rtsp_url)
 
         # --------------------------------------------------------
-        # 2. Storage Cleanup Worker
+        # 2. Automated Storage Cleanup Worker Thread
         # --------------------------------------------------------
         print("\n[System] Initializing Automated Cleanup Worker...")
         last_cleanup_time = init_cleanup()
@@ -108,7 +108,8 @@ def main():
         # 3. Multiprocessing & Shared Memory Setup for YOLO
         # --------------------------------------------------------
         print("\n[System] Initializing Shared Memory Ring Buffer...")
-        shm_slots = getattr(settings, "SHM_SLOTS", 6)
+        # Allocate sufficient buffer slots to avoid slot overwrites across multiple cameras
+        shm_slots = getattr(settings, "SHM_SLOTS", max(12, len(settings.CAMERAS) * 4))
         shm_buffer = SharedMemoryRingBuffer(
             name_prefix="yolo_frames",
             num_slots=shm_slots,
@@ -136,7 +137,7 @@ def main():
             raise RuntimeError("YOLO process failed to start!")
 
         # --------------------------------------------------------
-        # 4. Connect ALL Camera Streams & Windows Setup
+        # 4. Connect Camera Streams & Initialize OpenCV GUI Windows
         # --------------------------------------------------------
         print("\n[System] Connecting to Camera Streams...")
         for cid, cinfo in settings.CAMERAS.items():
@@ -150,9 +151,15 @@ def main():
                 continue
 
             camera_win_name = f"Camera: {cinfo.get('location', 'Unnamed')} | ({cinfo.get('model', 'Unnamed')}) | [{cid}]"
-
             cameras[cid] = Camera(camera_id=cid, rtsp=rtsp, camera_win_name=camera_win_name)
-            cv2.namedWindow(camera_win_name, cv2.WINDOW_NORMAL)
+            
+            # WINDOW_FREERATIO allows stretching image without maintaining aspect ratio paddings
+            cv2.namedWindow(camera_win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+            try:
+                cv2.setWindowProperty(camera_win_name, cv2.WND_PROP_TOOLBAR, cv2.WINDOW_GUI_NORMAL) # type: ignore
+            except Exception:
+                pass
+            cv2.resizeWindow(camera_win_name, settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE)
 
         if not cameras:
             print("[System] CRITICAL: No valid cameras could be connected. Exiting...")
@@ -161,30 +168,31 @@ def main():
         print(f"[System] All {len(cameras)} cameras connected. Starting main processing loop...\n")
 
         # --------------------------------------------------------
-        # Processing & Event Loop
+        # Main Event & Frame Processing Loop
         # --------------------------------------------------------
         while True:
             now = time.time()
 
-            # 1. Scheduled recording maintenance & Hourly file rotation (every 5s)
+            # 1. Periodically verify recorder health and schedule windows (every 5s)
             if now - last_schedule_check >= 5.0:
                 last_schedule_check = now
                 should_record = is_recording_time()
 
                 for cid, rec in recorders.items():
+                    # Checking if the active camera stream is currently alive
                     if cid in cameras:
                         if should_record:
                             if not rec.is_recording():
                                 print(f"[Recorder:{cid}] Starting scheduled recording...", flush=True)
                                 rec.start_recording()
                             else:
-                                # Ensure hour transition rotation is executed
-                                rec.check_hour_rotation()
-                        elif not should_record and rec.is_recording():
+                                # Verify running process state and restart if FFmpeg crashed
+                                rec.check_health()
+                        elif rec.is_recording():
                             print(f"[Recorder:{cid}] Stopping scheduled recording...", flush=True)
                             rec.stop_recording()
 
-            # 2. Retrieve processed metadata or frames from YOLO worker
+            # 2. Consume processed metadata and annotated frames from YOLO worker
             while not yolo_output_queue.empty():
                 try:
                     res = yolo_output_queue.get_nowait()
@@ -194,74 +202,67 @@ def main():
                 except Exception:
                     break
 
-            # 3. Read camera frames, write to SHM, and queue index
+            # 3. Read camera streams, write into Shared Memory, and send to queue
             for cid, cam in list(cameras.items()):
                 frame = cam.get_frame()
-
                 if frame is None:
                     continue
 
-                # Prepare frame matching YOLO input resolution
-                if frame.shape[:2] != (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE):
-                    yolo_frame = cv2.resize(
-                        frame, (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE)
-                    )
+                # Correct check for (width, height) format matching OpenCV standards
+                target_dim = (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE)
+                if (frame.shape[1], frame.shape[0]) != target_dim:
+                    yolo_frame = cv2.resize(frame, target_dim)
                 else:
                     yolo_frame = frame
 
-                # Write directly to Shared Memory and get slot index
+                # Write array directly to Shared Memory Ring Buffer
                 slot_idx, _ = shm_buffer.write_next(yolo_frame)
 
-                # Push slot reference to worker queue (Zero-Copy)
+                # Push slot index to worker queue (Zero-Copy Transfer)
                 if not yolo_input_queue.full():
                     try:
                         yolo_input_queue.put_nowait((cid, slot_idx))
                     except Exception:
                         pass
 
-                # Display latest annotated frame or fallback to raw stream
-                display_frame = latest_frames.get(cid, frame)
+                # Render either annotated frame or fallback resized video stream
+                display_frame = latest_frames.get(cid, yolo_frame)
                 cv2.imshow(cam.camera_win_name, display_frame)
 
-            # 4. Handle OpenCV UI events (1ms delay keeps UI fluid)
+            # 4. Handle GUI keypress events (1ms wait keeps UI responsive)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:
                 print("\n[System] Exit requested via key press ('q' or ESC). Exiting main loop...", flush=True)
                 break
 
-            # 5. Check for GUI window closure events
+            # 5. Detect closed OpenCV GUI windows
             closed_cids = []
             for cid, cam in cameras.items():
                 prop_visible = cv2.getWindowProperty(cam.camera_win_name, cv2.WND_PROP_VISIBLE)
                 if prop_visible < 1:
                     closed_cids.append(cid)
 
-            # 6. Safely release resources for closed camera windows
+            # 6. Gracefully release resources associated with closed camera windows
             for cid in closed_cids:
                 cam = cameras.pop(cid)
-                print(f"\n[System] Window '{cam.camera_win_name}' closed. Releasing camera [{cid}]...", flush=True)
+                print(f"\n[System] Window closed. Releasing camera [{cid}]...", flush=True)
 
                 if cid in recorders:
                     try:
-                        if recorders[cid].is_recording():
-                            recorders[cid].stop_recording()
+                        recorders[cid].stop_recording()
                     except Exception as e:
                         print(f"[System] Error stopping recorder [{cid}]: {e}", flush=True)
                     del recorders[cid]
 
                 try:
                     cam.stop()
-                except Exception as e:
-                    print(f"[System] Error stopping camera [{cid}]: {e}", flush=True)
-
-                try:
                     cv2.destroyWindow(cam.camera_win_name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[System] Error closing camera resources [{cid}]: {e}", flush=True)
 
                 latest_frames.pop(cid, None)
 
-            # Break loop if all windows were closed
+            # Terminate main application loop if all windows were closed
             if not cameras:
                 print("[System] All camera windows closed. Exiting main loop...", flush=True)
                 break
@@ -277,25 +278,33 @@ def main():
     finally:
         print("\n[System] Cleaning up resources...", flush=True)
 
-        # 1. Safely stop all active native FFmpeg recorders
-        for cid, rec in recorders.items():
+        # 1. Safely terminate all running native FFmpeg recorders
+        for cid, rec in list(recorders.items()):
             try:
-                if rec.is_recording():
-                    print(f"[System] [{cid}] Stopping recorder...", flush=True)
-                    rec.stop_recording()
+                rec.stop_recording()
             except Exception as e:
                 print(f"[System] Error stopping recorder {cid}: {e}", flush=True)
 
         # 2. Stop camera video capture threads
-        for cid, cam in cameras.items():
+        for cid, cam in list(cameras.items()):
             try:
                 cam.stop()
             except Exception as e:
                 print(f"[System] Error stopping camera {cid}: {e}", flush=True)
 
-        # 3. Gracefully terminate YOLO subprocess and drain IPC queues
+        # 3. Terminate YOLO worker subprocess and clear IPC queues
         if yolo_stop_event is not None:
             yolo_stop_event.set()
+
+        if yolo_process is not None and yolo_process.is_alive():
+            print("[System] Terminating YOLO process...", flush=True)
+            yolo_process.join(timeout=0.5)
+            if yolo_process.is_alive():
+                yolo_process.terminate()
+                try:
+                    yolo_process.kill()
+                except Exception:
+                    pass
 
         if yolo_input_queue is not None:
             yolo_input_queue.close()
@@ -305,19 +314,16 @@ def main():
             yolo_output_queue.close()
             yolo_output_queue.cancel_join_thread()
 
-        if yolo_process is not None and yolo_process.is_alive():
-            print("[System] Terminating YOLO process...", flush=True)
-            yolo_process.join(timeout=1.0)
-            if yolo_process.is_alive():
-                yolo_process.terminate()
-
-        # 4. Release Shared Memory Block from OS Kernel
+        # 4. Release Shared Memory Block allocations
         if shm_buffer is not None:
             print("[System] Unlinking Shared Memory allocations...", flush=True)
-            shm_buffer.close()
-            shm_buffer.unlink()
+            try:
+                shm_buffer.close()
+                shm_buffer.unlink()
+            except Exception:
+                pass
 
-        # 5. Destroy active OpenCV GUI windows
+        # 5. Destroy OpenCV GUI windows
         try:
             cv2.destroyAllWindows()
         except Exception:

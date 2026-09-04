@@ -25,6 +25,15 @@ class SharedMemoryRingBuffer:
         for i in range(num_slots):
             shm_name = f"{name_prefix}_slot_{i}"
             if create:
+                try:
+                    temp_shm = shared_memory.SharedMemory(name=shm_name)
+                    temp_shm.close()
+                    temp_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
                 shm = shared_memory.SharedMemory(
                     name=shm_name, create=True, size=self.frame_bytes
                 )
@@ -39,6 +48,13 @@ class SharedMemoryRingBuffer:
     def write_next(self, frame: np.ndarray) -> tuple[int, str]:
         """Copies frame bytes into the current slot and returns slot index & SHM name."""
         slot_idx = self.write_idx
+
+        # Валидация формы входящего кадра для предотвращения крашей
+        if frame.shape != self.shape or frame.dtype != self.dtype:
+            raise ValueError(
+                f"[SHM] Frame shape/dtype mismatch! Expected {self.shape} ({self.dtype}), got {frame.shape} ({frame.dtype})"
+            )
+
         np.copyto(self.arrays[slot_idx], frame)
         shm_name = self.shm_blocks[slot_idx].name
 
@@ -51,17 +67,28 @@ class SharedMemoryRingBuffer:
         return self.arrays[slot_idx]
 
     def close(self):
-        """Closes memory mappings for the current process."""
+        """Closes memory mappings for the current process safely releasing NumPy exports."""
+        # КРИТИЧНО: удаляем ссылки на буферы NumPy перед закрытием mmap
+        self.arrays.clear()
+
         for shm in self.shm_blocks:
             try:
                 shm.close()
             except Exception:
                 pass
+        self.shm_blocks.clear()
 
     def unlink(self):
         """Frees shared memory region from the OS kernel (Call only from master process)."""
+        self.arrays.clear()
+
         for shm in self.shm_blocks:
+            try:
+                shm.close()
+            except Exception:
+                pass
             try:
                 shm.unlink()
             except Exception:
                 pass
+        self.shm_blocks.clear()
