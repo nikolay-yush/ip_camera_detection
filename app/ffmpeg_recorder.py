@@ -1,5 +1,6 @@
 import sys
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from app.settings import settings
 
@@ -16,12 +17,15 @@ class NativeFFmpegRecorder:
         if self.is_recording():
             return
 
-        # Create output directory for the camera (FFmpeg formats date and hour in the filename)
-        out_dir = settings.EVENTS_DIR / self.camera_id
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # 1. Explicitly create today's subfolder to prevent FFmpeg "No such file or directory" error
+        now = datetime.now()
+        today_dir = settings.EVENTS_DIR / now.strftime("%Y-%m-%d") / self.camera_id
+        today_dir.mkdir(parents=True, exist_ok=True)
 
-        # Output path template using strftime formatting: .../camera_id/2026-03-30_14-00.mkv
-        output_template = str(out_dir / "%Y-%m-%d_%H-00.mkv")
+        # 2. Path template for dynamic folder creation (%Y-%m-%d) and hourly files (%Y-%m-%d_%H-00.mkv)
+        output_template = str(
+            settings.EVENTS_DIR / "%Y-%m-%d" / self.camera_id / "%Y-%m-%d_%H-00.mkv"
+        )
 
         cmd = [
             "ffmpeg",
@@ -36,7 +40,7 @@ class NativeFFmpegRecorder:
             "-f", "segment",
             "-segment_time", "3600",      # Split recording every 3600 seconds (1 hour)
             "-reset_timestamps", "1",
-            "-strftime", "1",             # Enable strftime patterns (%Y-%m-%d_%H-00) in output path
+            "-strftime", "1",             # Enable strftime patterns in output path
             output_template,
         ]
 
