@@ -25,8 +25,9 @@ class SharedMemoryRingBuffer:
         for i in range(num_slots):
             shm_name = f"{name_prefix}_slot_{i}"
             if create:
+                # Force cleanup of orphaned shared memory segments from previous crashed runs
                 try:
-                    temp_shm = shared_memory.SharedMemory(name=shm_name)
+                    temp_shm = shared_memory.SharedMemory(name=shm_name, create=False)
                     temp_shm.close()
                     temp_shm.unlink()
                 except FileNotFoundError:
@@ -49,7 +50,7 @@ class SharedMemoryRingBuffer:
         """Copies frame bytes into the current slot and returns slot index & SHM name."""
         slot_idx = self.write_idx
 
-        # Валидация формы входящего кадра для предотвращения крашей
+        # Validate incoming frame dimensions and dtype to prevent crashes
         if frame.shape != self.shape or frame.dtype != self.dtype:
             raise ValueError(
                 f"[SHM] Frame shape/dtype mismatch! Expected {self.shape} ({self.dtype}), got {frame.shape} ({frame.dtype})"
@@ -62,13 +63,15 @@ class SharedMemoryRingBuffer:
         self.write_idx = (self.write_idx + 1) % self.num_slots
         return slot_idx, shm_name
 
-    def get_array(self, slot_idx: int) -> np.ndarray:
+    def get_array(self, slot_idx: int) -> np.ndarray | None:
         """Returns direct zero-copy reference to the frame stored in specified slot."""
-        return self.arrays[slot_idx]
+        if 0 <= slot_idx < self.num_slots and self.arrays:
+            return self.arrays[slot_idx]
+        return None
 
-    def close(self):
+    def close(self) -> None:
         """Closes memory mappings for the current process safely releasing NumPy exports."""
-        # КРИТИЧНО: удаляем ссылки на буферы NumPy перед закрытием mmap
+        # CRITICAL: Clear NumPy buffer references first to allow underlying C-mmap to unbind
         self.arrays.clear()
 
         for shm in self.shm_blocks:
@@ -78,17 +81,14 @@ class SharedMemoryRingBuffer:
                 pass
         self.shm_blocks.clear()
 
-    def unlink(self):
+    def unlink(self) -> None:
         """Frees shared memory region from the OS kernel (Call only from master process)."""
-        self.arrays.clear()
+        self.close()
 
+        # Re-attach temporarily if needed or unlink directly if references exist
+        # Note: shm.unlink() must be called once by the creating process
         for shm in self.shm_blocks:
-            try:
-                shm.close()
-            except Exception:
-                pass
             try:
                 shm.unlink()
             except Exception:
                 pass
-        self.shm_blocks.clear()

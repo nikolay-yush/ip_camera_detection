@@ -7,16 +7,9 @@ import multiprocessing as mp
 import cv2
 import numpy as np
 
-from app.camera import Camera
-from app.cleanup import init_cleanup
-from app.ffmpeg_recorder import NativeFFmpegRecorder
-from app.settings import settings
-from app.utils.silence_err_c import silence_c_libraries
-from app.workers.yolo_worker import yolo_worker
-from app.workers.cleanup_worker import cleanup_worker
-from app.utils.is_recording_time import is_recording_time
-from app.utils.force_kill_self import force_kill_self
-from app.utils.shm_ring_buffer import SharedMemoryRingBuffer
+from app.utils.silence_err_c import silence_c_libraries_safe
+
+silence_c_libraries_safe()
 
 
 # ============================================================
@@ -30,9 +23,20 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "max_delay;0"
 )
 
-os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["FFMPEG_LOGLEVEL"] = "quiet"
+os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
 
-silence_c_libraries()  # Suppress C-level stderr logs from FFmpeg/OpenCV
+
+from app.camera import Camera
+from app.cleanup import init_cleanup
+from app.ffmpeg_recorder import NativeFFmpegRecorder
+from app.settings import settings
+from app.workers.yolo_worker import yolo_worker
+from app.workers.cleanup_worker import cleanup_worker
+from app.utils.is_recording_time import is_recording_time
+from app.utils.force_kill_self import force_kill_self
+from app.utils.shm_ring_buffer import SharedMemoryRingBuffer
 
 
 # ============================================================
@@ -179,18 +183,20 @@ def main():
                 should_record = is_recording_time()
 
                 for cid, rec in recorders.items():
-                    # Checking if the active camera stream is currently alive
                     if cid in cameras:
+                        is_active = rec.is_recording()
+
                         if should_record:
-                            if not rec.is_recording():
+                            if not is_active:
                                 print(f"[Recorder:{cid}] Starting scheduled recording...", flush=True)
                                 rec.start_recording()
                             else:
-                                # Verify running process state and restart if FFmpeg crashed
-                                rec.check_health()
-                        elif rec.is_recording():
-                            print(f"[Recorder:{cid}] Stopping scheduled recording...", flush=True)
-                            rec.stop_recording()
+                                # Smooth hourly rotation without internal FFmpeg segmenter
+                                rec.rotate_if_new_hour()
+                        else:
+                            if is_active:
+                                print(f"[Recorder:{cid}] Stopping scheduled recording...", flush=True)
+                                rec.stop_recording()
 
             # 2. Consume processed metadata and annotated frames from YOLO worker
             while not yolo_output_queue.empty():

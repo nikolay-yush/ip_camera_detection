@@ -9,8 +9,6 @@ import time
 import traceback
 import multiprocessing as mp
 import numpy as np
-import torch
-from ultralytics import YOLO
 
 from app.event_manager import EventManager
 from app.settings import settings
@@ -23,6 +21,9 @@ def yolo_worker(
     stop_event: mp.Event,  # type: ignore
 ) -> None:
     print("[YOLO Worker] Process started. Initializing Shared Memory access...", flush=True)
+
+    import torch
+    from ultralytics import YOLO
 
     # Restrict PyTorch thread pool for intra/inter-op parallelism
     torch.set_num_threads(6)
@@ -45,20 +46,6 @@ def yolo_worker(
     # Safe retrieval of configuration variables
     conf_threshold = getattr(settings, "YOLO_CONF", getattr(settings, "YOLO_CONFIDENCE", 0.35))
     person_ids = getattr(settings, "YOLO_PERSON_CLASS_IDS", [0])
-
-    # Warm up model runtime using a dummy zero-array
-    dummy = np.zeros(
-        (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE, 3),
-        dtype=np.uint8,
-    )
-    model.predict(
-        dummy,
-        classes=person_ids,
-        conf=conf_threshold,
-        imgsz=settings.YOLO_FRAME_SIZE,
-        device="cpu",
-        verbose=False,
-    )
 
     event_manager = EventManager()
     last_event_times: dict[str, float] = {}

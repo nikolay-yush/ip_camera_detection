@@ -24,8 +24,8 @@ class EventManager:
             thread_name_prefix="event-async",
         )
 
-        # Cache last created directory key to prevent redundant filesystem syscalls
-        self._current_dir_cache: str = ""
+        # Set of created directories for the current date to prevent disk I/O overhead
+        self._created_dirs: set[str] = set()
 
         self.thread = threading.Thread(
             target=self._worker,
@@ -59,9 +59,11 @@ class EventManager:
                 # 1. Save screenshot to structured directory using optimized JPEG compression
                 screenshot_path = self._save_screenshot(camera_id, frame)
 
-                # 2. Retrieve user-friendly camera name from configuration settings
+                # 2. Retrieve user-friendly camera name matching main.py logic (location -> model -> camera_id)
                 camera_info = settings.CAMERAS.get(camera_id, {})
-                camera_name = camera_info.get("name", camera_id)
+                camera_name = camera_info.get(
+                    "location", camera_info.get("model", camera_info.get("name", camera_id))
+                )
 
                 # 3. Offload I/O bound operations (Audio & Telegram API) to background thread pool
                 self.executor.submit(play_sound)
@@ -70,7 +72,7 @@ class EventManager:
                 )
 
             except Exception as exc:
-                print(f"[EventManager] Event worker error: {exc}")
+                print(f"[EventManager] Event worker error: {exc}", flush=True)
 
             finally:
                 self.queue.task_done()
@@ -82,10 +84,10 @@ class EventManager:
 
         event_dir = settings.EVENTS_DIR / date_str / camera_id
 
-        # Invoke mkdir only when date or camera target changes
-        if self._current_dir_cache != dir_key:
+        # Safely create folder once per camera per day using set cache
+        if dir_key not in self._created_dirs:
             event_dir.mkdir(parents=True, exist_ok=True)
-            self._current_dir_cache = dir_key
+            self._created_dirs.add(dir_key)
 
         screenshot_path = event_dir / f"event_{now:%H-%M-%S-%f}.jpg"
 
@@ -99,7 +101,7 @@ class EventManager:
         if not ok:
             raise RuntimeError(f"Failed to save screenshot: {screenshot_path}")
 
-        print(f"[EventManager] Screenshot saved: {screenshot_path}")
+        print(f"[EventManager] Screenshot saved: {screenshot_path}", flush=True)
         return screenshot_path
 
     def _safe_send_telegram(self, screenshot_path: Path, camera_name: str) -> None:
@@ -107,7 +109,7 @@ class EventManager:
         try:
             send_detection(screenshot_path, camera_id=camera_name)  # type: ignore
         except Exception as exc:
-            print(f"[EventManager] Telegram dispatch failed: {exc}")
+            print(f"[EventManager] Telegram dispatch failed: {exc}", flush=True)
 
     def stop(self):
         self.running = False
