@@ -1,13 +1,8 @@
 import time
-from app.cleanup import run_cleanup_if_needed
+from app.cleanup import run_cleanup
 
 
-def cleanup_worker(last_cleanup_time: float):
-
+def cleanup_worker():
     while True:
-
-        last_cleanup_time = run_cleanup_if_needed(
-            last_cleanup_time
-        )
-
+        run_cleanup()
         time.sleep(3600)

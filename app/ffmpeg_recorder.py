@@ -26,8 +26,8 @@ class NativeFFmpegRecorder:
         cam_dir = settings.EVENTS_DIR / date_str / self.camera_id
         cam_dir.mkdir(parents=True, exist_ok=True)
 
-        # File name is just the starting hour (e.g., 19.mp4 or 19-00.mp4)
-        output_file = str(cam_dir / f"{now:%H}.mp4")
+        # File name is just the starting hour (e.g., 19.mkv or 19-00.mkv)
+        output_file = str(cam_dir / f"{now:%Y-%m-%d %H-00}.mkv")
 
         # Stable raw stream copy command via UDP
         cmd = [
@@ -38,7 +38,6 @@ class NativeFFmpegRecorder:
             "-buffer_size", "10240000",             # 10MB UDP socket buffer
             "-i", self.rtsp_url,
             "-c", "copy",                           # Direct stream copy without decoding
-            "-movflags", "+faststart",              # Allows smooth playback of MP4 files
             "-y",                                   # Overwrite if file exists
             output_file,
         ]

@@ -6,39 +6,11 @@ from datetime import datetime, timedelta
 from app.settings import settings
 
 
-STATE_FILE_NAME = ".cleanup_state.txt"
-
-
-def _load_last_cleanup(state_file: Path) -> float:
-
-    if state_file.exists():
-
-        try:
-            return float(
-                state_file.read_text().strip()
-            )
-
-        except Exception:
-            return 0.0
-
-    return 0.0
-
-
-def _save_last_cleanup(
-    state_file: Path,
-    timestamp: float,
-) -> None:
-
-    state_file.write_text(
-        str(timestamp)
-    )
-
-
 def cleanup_old_events(
     base_dir: Path,
     days: int,
 ) -> None:
-
+    
     cutoff = (
         datetime.now().date()
         - timedelta(days=days)
@@ -74,62 +46,26 @@ def cleanup_old_events(
             )
 
 
-def run_cleanup_if_needed(
-    last_cleanup_time: float,
-    force: bool = False,
-) -> float:
+def run_cleanup() -> None:
 
     now = time.time()
 
-    cleanup_interval = (
-        settings.CLEANUP_DAYS * 86400
+    print("[Cleanup] Running cleanup check...")
+
+    cleanup_old_events(
+        settings.EVENTS_DIR,
+        days=settings.CLEANUP_DAYS,
     )
 
-    state_file = (
-        settings.EVENTS_DIR
-        / STATE_FILE_NAME
-    )
-
-    if (
-        force
-        or now - last_cleanup_time > cleanup_interval
-    ):
-
-        print(
-            "[Cleanup] Running cleanup check..."
-        )
-
-        cleanup_old_events(
-            settings.EVENTS_DIR,
-            days=settings.CLEANUP_DAYS,
-        )
-
-        _save_last_cleanup(
-            state_file,
-            now,
-        )
-
-        return now
-
-    return last_cleanup_time
+    return now
 
 
-def init_cleanup() -> float:
+
+def init_cleanup() -> None:
 
     settings.EVENTS_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    state_file = (
-        settings.EVENTS_DIR
-        / STATE_FILE_NAME
-    )
-
-    last_cleanup = _load_last_cleanup(
-        state_file
-    )
-
-    return run_cleanup_if_needed(
-        last_cleanup
-    )
+    return run_cleanup()
