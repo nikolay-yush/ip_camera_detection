@@ -1,5 +1,5 @@
 import time
-from app.settings import settings
+from app.core.settings import settings
 
 
 def is_recording_time() -> bool:

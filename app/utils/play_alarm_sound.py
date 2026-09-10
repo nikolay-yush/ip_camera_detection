@@ -2,11 +2,12 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+from app.core.settings import settings
 
-SOUND_FILE = Path("alarm.wav")
+SOUND_FILE = settings.SOUNDS_DIR / "alarm.wav"
 
 
-def play_sound() -> None:
+def play_alarm_sound() -> None:
     """Play custom alarm sound asynchronously across Windows and Linux."""
     try:
         if not SOUND_FILE.exists():

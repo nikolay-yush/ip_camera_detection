@@ -1,346 +1,317 @@
+import logging
+import multiprocessing as mp
 import os
 import signal
-import sys
-import threading
 import time
-import multiprocessing as mp
 import cv2
-import numpy as np
 
+from app.stream_recorders.ffmpeg_recorder import FFmpegRecorder
 from app.utils.silence_err_c import silence_c_libraries_safe
+from app.workers.events_cleanup_worker import EventsCleanupWorker
 
 silence_c_libraries_safe()
 
-
-# ============================================================
-# Environment Setup (Low Latency RTSP & OpenCV Config)
-# ============================================================
-
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rtsp_transport;tcp|"  # Enforce TCP transport for stream stability
+    "rtsp_transport;udp|"
     "fflags;nobuffer|"
     "flags;low_delay|"
     "max_delay;0"
 )
 
-os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-os.environ["FFMPEG_LOGLEVEL"] = "quiet"
-os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
-
-
 from app.camera import Camera
-from app.cleanup import init_cleanup
-from app.ffmpeg_recorder import NativeFFmpegRecorder
-from app.settings import settings
-from app.workers.yolo_worker import yolo_worker
-from app.workers.cleanup_worker import cleanup_worker
-from app.utils.is_recording_time import is_recording_time
-from app.utils.force_kill_self import force_kill_self
-from app.utils.shm_ring_buffer import SharedMemoryRingBuffer
+from app.core.settings import settings
+from app.core.setup_logging import setup_logging
+from app.event_detectors.yolo_detector import yolo_detection
+from app.utils.force_kill_all_processes import force_kill_all_processes
+from app.event_manager import EventManager
+
+setup_logging()
+logger = logging.getLogger("main")
+
+# Limit: Process up to 5 cameras per worker instance
+MAX_CAMERAS = 5
 
 
-# ============================================================
-# Main Application Entry Point
-# ============================================================
+def main() -> None:
+    logger.info("Camera management system initializing...")
 
-def main():
-    print("[System] Starting Camera Detection YOLO Application...")
+    # 0. Start background thread to purge expired event recordings
+    events_cleanup_worker = EventsCleanupWorker(
+        base_dir=settings.EVENTS_DIR,
+        retention_days=settings.CLEANUP_DAYS,
+        check_interval_seconds=settings.CLEANUP_CHECK_INTERVAL_SECONDS,
+    )
+    events_cleanup_worker.start()
 
-    cameras: dict[str, Camera] = {}
-    recorders: dict[str, NativeFFmpegRecorder] = {}
+    # 1. Fetch maximum of 5 cameras from active configuration
+    camera_items = list(settings.CAMERAS.items())[:MAX_CAMERAS]
 
-    # Cache latest YOLO annotated frames for rendering in GUI windows
-    latest_frames: dict[str, np.ndarray] = {}
+    raw_cameras: dict[str, Camera] = {}
+    for cam_id, cam_config in camera_items:
+        raw_cameras[str(cam_id)] = Camera(
+            camera_id=str(cam_id),
+            rtsp=cam_config.get("rtsp", ""),
+            camera_win_name=cam_config.get("window_name", ""),
+        )
 
-    # Timers for periodic health checks
-    last_schedule_check = 0.0
+    logger.info("Waiting for RTSP connection (%d cameras)...", len(raw_cameras))
 
-    # Placeholders for multiprocessing components
-    yolo_process: mp.Process | None = None
-    yolo_input_queue: mp.Queue | None = None
-    yolo_output_queue: mp.Queue | None = None
-    yolo_stop_event: mp.Event | None = None # type: ignore
-    shm_buffer: SharedMemoryRingBuffer | None = None
+    # 2. Wait for camera threads initialization & launch recorders
+    active_cameras: dict[str, Camera] = {}
+    active_recorders: dict[str, FFmpegRecorder] = {}
 
-    # --------------------------------------------------------
-    # 0. Shutdown Signal Handling
-    # --------------------------------------------------------
-    def shutdown(sig, frame):
-        print("\n[System] Shutdown signal received. Triggering exit...", flush=True)
-        raise KeyboardInterrupt  
+    for cam_id, camera in raw_cameras.items():
+        while camera.is_initializing:
+            time.sleep(0.05)
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+        if camera.initial_success:
+            active_cameras[cam_id] = camera
 
+            # Initialize and launch stream dump recorder
+            recorder = FFmpegRecorder(camera_id=cam_id, rtsp_url=camera.rtsp)
+            recorder.start_recording()
+            active_recorders[cam_id] = recorder
+
+            logger.info("[Main] Camera '%s' connected and recording started.", cam_id)
+
+            # Initialize resizable OpenCV window
+            win_name = camera.camera_win_name or f"Camera {cam_id}"
+            cv2.namedWindow(
+                win_name, 
+                cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_FREERATIO
+            )
+            cv2.resizeWindow(win_name, 640, 360)
+        else:
+            logger.error("[Main] Camera '%s' failed initial connection.", cam_id)
+            camera.stop()
+
+    if not active_cameras:
+        logger.warning("No active cameras available. Exiting...")
+        events_cleanup_worker.stop()
+        force_kill_all_processes()
+        return
+
+    num_active = len(active_cameras)
+    logger.info("Successfully initialized %d cameras.", num_active)
+
+    # 3. Spawn a single isolated YOLO inference worker process
+    input_queue = mp.Queue(maxsize=num_active * 2)
+    output_queue = mp.Queue(maxsize=num_active * 2)
+    yolo_stop_event = mp.Event()
+
+    yolo_process = mp.Process(
+        target=yolo_detection,
+        args=(input_queue, output_queue, yolo_stop_event),
+        daemon=True,
+        name="yolo-worker",
+    )
+    yolo_process.start()
+    logger.info("Started single YOLO process for %d cameras.", num_active)
+
+    # 4. Bind system OS signals for graceful shutdown handling
+    stop_event = False
+
+    def handle_shutdown(signum, frame):
+        nonlocal stop_event
+        logger.info("Shutdown signal received...")
+        stop_event = True
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+    # Event manager instances for each camera
+    event_managers: dict[str, EventManager] = {
+        cam_id: EventManager() for cam_id in active_cameras
+    }
+
+    # Last event times for each camera
+    last_event_times: dict[str, float] = {
+        cam_id: 0.0 for cam_id in active_cameras
+    }
+
+    # Frame and detection metadata caches
+    latest_frames: dict[str, object] = {}
+    latest_detections: dict[str, list] = {}
+
+    # 5. Main processing loop
     try:
-        # --------------------------------------------------------
-        # 1. Load Camera Configurations & Recorders
-        # --------------------------------------------------------
-        if not settings.CAMERAS:
-            print("[System] CRITICAL: No cameras defined in CAMERAS configuration!")
-            sys.exit(1)
+        while not stop_event:
+            # A. Fetch raw frames from active camera threads
+            for cam_id, camera in list(active_cameras.items()):
+                if camera.no_frame_duration > 10.0:
+                    logger.warning(
+                        "[Main] Camera '%s' stream lost! No frames for %.1f sec.",
+                        cam_id,
+                        camera.no_frame_duration,
+                    )
 
-        print(f"[System] Loaded {len(settings.CAMERAS)} camera(s) from settings:")
-        for cid, cinfo in settings.CAMERAS.items():
-            cam_name = cinfo.get("location", cinfo.get("model", cid))
-            rtsp_url = cinfo.get("rtsp")
+                win_name = camera.camera_win_name or f"Camera {cam_id}"
 
-            if not rtsp_url:
-                print(f"[System] WARNING: Missing RTSP URL for camera '{cid}'. Skipping...")
-                continue
+                # Check if user closed the window using the OS 'X' button
+                if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                    logger.info("[Main] Window for camera '%s' closed by user. Stopping...", cam_id)
 
-            print(f"Camera: {cid} ({cam_name}) | RTSP: {rtsp_url}")
+                    cv2.destroyWindow(win_name)
 
-            if cinfo.get("is_recording", False):
-                print(f"[System] [{cid}] Initializing Native FFmpeg Recorder...")
-                recorders[cid] = NativeFFmpegRecorder(cid, rtsp_url)
+                    if cam_id in active_recorders:
+                        active_recorders[cam_id].stop_recording()
+                        del active_recorders[cam_id]
 
-        # --------------------------------------------------------
-        # 2. Automated Storage Cleanup Worker Thread
-        # --------------------------------------------------------
-        print("\n[System] Initializing Automated Cleanup Worker...")
-        last_cleanup_time = init_cleanup()
-        cleanup_thread = threading.Thread(
-            target=cleanup_worker,
-            args=(last_cleanup_time,),
-            daemon=True,
-            name="cleanup-worker",
-        )
-        cleanup_thread.start()
+                    if cam_id in event_managers:
+                        event_managers[cam_id].stop()
+                        del event_managers[cam_id]
+                    last_event_times.pop(cam_id, None)
 
-        # --------------------------------------------------------
-        # 3. Multiprocessing & Shared Memory Setup for YOLO
-        # --------------------------------------------------------
-        print("\n[System] Initializing Shared Memory Ring Buffer...")
-        # Allocate sufficient buffer slots to avoid slot overwrites across multiple cameras
-        shm_slots = getattr(settings, "SHM_SLOTS", max(12, len(settings.CAMERAS) * 4))
-        shm_buffer = SharedMemoryRingBuffer(
-            name_prefix="yolo_frames",
-            num_slots=shm_slots,
-            shape=(settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE, 3),
-            dtype=np.uint8,
-            create=True,
-        )
+                    camera.stop()
+                    del active_cameras[cam_id]
+                    latest_frames.pop(cam_id, None)
+                    latest_detections.pop(cam_id, None)
+                    continue
 
-        print("[System] Spawning Isolated YOLO Process...")
-        queue_size = max(4, len(settings.CAMERAS) * 2)
-        yolo_input_queue = mp.Queue(maxsize=queue_size)
-        yolo_output_queue = mp.Queue(maxsize=queue_size)
-        yolo_stop_event = mp.Event()
+                frame = camera.get_frame()
+                if frame is not None:
+                    latest_frames[cam_id] = frame
 
-        yolo_process = mp.Process(
-            target=yolo_worker,
-            args=(yolo_input_queue, yolo_output_queue, yolo_stop_event),
-            name="yolo-worker-process",
-            daemon=True,
-        )
-        yolo_process.start()
+                    try:
+                        input_queue.put_nowait((cam_id, frame))
+                    except Exception:
+                        pass  # Skip frame submission if YOLO queue is congested
 
-        if not yolo_process.is_alive():
-            print("[System] CRITICAL: YOLO process failed to start. Exiting...")
-            raise RuntimeError("YOLO process failed to start!")
+            # Exit early if all windows were closed manually by the user
+            if not active_cameras:
+                logger.info("[Main] All camera windows have been closed. Exiting...")
+                break
 
-        # --------------------------------------------------------
-        # 4. Connect Camera Streams & Initialize OpenCV GUI Windows
-        # --------------------------------------------------------
-        print("\n[System] Connecting to Camera Streams...")
-        for cid, cinfo in settings.CAMERAS.items():
-            rtsp = cinfo.get("rtsp")
-
-            if not rtsp:
-                if cid in recorders:
-                    if recorders[cid].is_recording():
-                        recorders[cid].stop_recording()
-                    del recorders[cid]
-                continue
-
-            camera_win_name = f"Camera: {cinfo.get('location', 'Unnamed')} | ({cinfo.get('model', 'Unnamed')}) | [{cid}]"
-            cameras[cid] = Camera(camera_id=cid, rtsp=rtsp, camera_win_name=camera_win_name)
-            
-            # WINDOW_FREERATIO allows stretching image without maintaining aspect ratio paddings
-            cv2.namedWindow(camera_win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
-            try:
-                cv2.setWindowProperty(camera_win_name, cv2.WND_PROP_TOOLBAR, cv2.WINDOW_GUI_NORMAL) # type: ignore
-            except Exception:
-                pass
-            cv2.resizeWindow(camera_win_name, settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE)
-
-        if not cameras:
-            print("[System] CRITICAL: No valid cameras could be connected. Exiting...")
-            raise RuntimeError("No cameras connected.")
-
-        print(f"[System] All {len(cameras)} cameras connected. Starting main processing loop...\n")
-
-        # --------------------------------------------------------
-        # Main Event & Frame Processing Loop
-        # --------------------------------------------------------
-        while True:
-            now = time.time()
-
-            # 1. Periodically verify recorder health and schedule windows (every 5s)
-            if now - last_schedule_check >= 5.0:
-                last_schedule_check = now
-                should_record = is_recording_time()
-
-                for cid, rec in recorders.items():
-                    if cid in cameras:
-                        is_active = rec.is_recording()
-
-                        if should_record:
-                            if not is_active:
-                                print(f"[Recorder:{cid}] Starting scheduled recording...", flush=True)
-                                rec.start_recording()
-                            else:
-                                # Smooth hourly rotation without internal FFmpeg segmenter
-                                rec.rotate_if_new_hour()
-                        else:
-                            if is_active:
-                                print(f"[Recorder:{cid}] Stopping scheduled recording...", flush=True)
-                                rec.stop_recording()
-
-            # 2. Consume processed metadata and annotated frames from YOLO worker
-            while not yolo_output_queue.empty():
+            # B. Consume lightweight metadata (detections) from YOLO worker process
+            while True:
                 try:
-                    res = yolo_output_queue.get_nowait()
-                    if len(res) == 2:
-                        out_cid, processed_frame = res
-                        latest_frames[out_cid] = processed_frame
+                    res_cam_id, detections = output_queue.get_nowait()
+                    if res_cam_id in active_cameras:
+                        latest_detections[res_cam_id] = detections
                 except Exception:
                     break
 
-            # 3. Read camera streams, write into Shared Memory, and send to queue
-            for cid, cam in list(cameras.items()):
-                frame = cam.get_frame()
-                if frame is None:
-                    continue
+            # C. Render cached frames with lightweight overlays onto OpenCV GUI windows
+            for cam_id, display_frame in list(latest_frames.items()):
+                if cam_id in active_cameras:
+                    win_name = active_cameras[cam_id].camera_win_name or f"Camera {cam_id}"
+                    detections = latest_detections.get(cam_id, [])
 
-                # Correct check for (width, height) format matching OpenCV standards
-                target_dim = (settings.YOLO_FRAME_SIZE, settings.YOLO_FRAME_SIZE)
-                if (frame.shape[1], frame.shape[0]) != target_dim:
-                    yolo_frame = cv2.resize(frame, target_dim)
+                    if detections:
+                        now = time.monotonic()
+                        cooldown = getattr(settings, "EVENT_COOLDOWN", 5.0)
+
+                        if now - last_event_times.get(cam_id, 0.0) >= cooldown:
+                            last_event_times[cam_id] = now
+                            event_managers[cam_id].handle_detection(
+                                active_cameras[cam_id], display_frame
+                            )
+
+                        # Copy frame array only when drawing overlays
+                        render_frame = display_frame.copy()  # type: ignore
+                        h, w = render_frame.shape[:2]
+
+                        # Fast pixel denormalization and drawing loop
+                        for det in detections:
+                            box_norm = det.get("box_norm", [0, 0, 0, 0])
+                            x1 = int(box_norm[0] * w)
+                            y1 = int(box_norm[1] * h)
+                            x2 = int(box_norm[2] * w)
+                            y2 = int(box_norm[3] * h)
+
+                            label_name = det.get("label", det.get("class_name", "object"))
+                            conf = det.get("conf", 0.0)
+                            label_text = f"{label_name} {conf:.2f}"
+
+                            # 1. Bounding box
+                            cv2.rectangle(render_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                            # 2. Text background badge
+                            (text_w, text_h), baseline = cv2.getTextSize(
+                                label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                            )
+                            text_y1 = max(y1 - text_h - 4, 0)
+
+                            cv2.rectangle(render_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                            cv2.putText(
+                                render_frame,
+                                label_text,
+                                (x1, max(y1 - 7, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1.2,
+                                (255, 255, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+
+                        cv2.imshow(win_name, render_frame)  # type: ignore
+
+                    else:
+                        # Direct display without copying memory
+                        cv2.imshow(win_name, display_frame)  # type: ignore
+
+            # D. Ensure stream recorders are alive and perform hourly rotation
+            for recorder in active_recorders.values():
+                if not recorder.is_recording():
+                    logger.warning("[Main] Recorder '%s' died, restarting...", recorder.camera_id)
+                    recorder.start_recording()
                 else:
-                    yolo_frame = frame
+                    recorder.rotate_if_new_hour()
 
-                # Write array directly to Shared Memory Ring Buffer
-                slot_idx, _ = shm_buffer.write_next(yolo_frame)
-
-                # Push slot index to worker queue (Zero-Copy Transfer)
-                if not yolo_input_queue.full():
-                    try:
-                        yolo_input_queue.put_nowait((cid, slot_idx))
-                    except Exception:
-                        pass
-
-                # Render either annotated frame or fallback resized video stream
-                display_frame = latest_frames.get(cid, yolo_frame)
-                cv2.imshow(cam.camera_win_name, display_frame)
-
-            # 4. Handle GUI keypress events (1ms wait keeps UI responsive)
+            # E. Process GUI event loop and key press actions
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                print("\n[System] Exit requested via key press ('q' or ESC). Exiting main loop...", flush=True)
+            if key == 27 or key == ord("q"):
+                logger.info("Quit key pressed ('q' or ESC). Exiting main loop...")
+                stop_event = True
                 break
 
-            # 5. Detect closed OpenCV GUI windows
-            closed_cids = []
-            for cid, cam in cameras.items():
-                prop_visible = cv2.getWindowProperty(cam.camera_win_name, cv2.WND_PROP_VISIBLE)
-                if prop_visible < 1:
-                    closed_cids.append(cid)
-
-            # 6. Gracefully release resources associated with closed camera windows
-            for cid in closed_cids:
-                cam = cameras.pop(cid)
-                print(f"\n[System] Window closed. Releasing camera [{cid}]...", flush=True)
-
-                if cid in recorders:
-                    try:
-                        recorders[cid].stop_recording()
-                    except Exception as e:
-                        print(f"[System] Error stopping recorder [{cid}]: {e}", flush=True)
-                    del recorders[cid]
-
-                try:
-                    cam.stop()
-                    cv2.destroyWindow(cam.camera_win_name)
-                except Exception as e:
-                    print(f"[System] Error closing camera resources [{cid}]: {e}", flush=True)
-
-                latest_frames.pop(cid, None)
-
-            # Terminate main application loop if all windows were closed
-            if not cameras:
-                print("[System] All camera windows closed. Exiting main loop...", flush=True)
-                break
-
-            time.sleep(0.001)
-
-    except KeyboardInterrupt:
-        print("\n[System] Interrupted by user or signal.", flush=True)
-
-    except Exception as e:
-        print(f"\n[System] CRITICAL Exception: {e}", flush=True)
+    except Exception as exc:
+        logger.exception("Unexpected error in main loop: %s", exc)
 
     finally:
-        print("\n[System] Cleaning up resources...", flush=True)
+        logger.info("Closing OpenCV GUI windows...")
+        cv2.destroyAllWindows()
 
-        # 1. Safely terminate all running native FFmpeg recorders
-        for cid, rec in list(recorders.items()):
-            try:
-                rec.stop_recording()
-            except Exception as e:
-                print(f"[System] Error stopping recorder {cid}: {e}", flush=True)
+        logger.info("Stopping stream recorders...")
+        for recorder in active_recorders.values():
+            recorder.stop_recording()
 
-        # 2. Stop camera video capture threads
-        for cid, cam in list(cameras.items()):
-            try:
-                cam.stop()
-            except Exception as e:
-                print(f"[System] Error stopping camera {cid}: {e}", flush=True)
+        logger.info("Stopping event managers...")
+        for manager in event_managers.values():
+            manager.stop()
 
-        # 3. Terminate YOLO worker subprocess and clear IPC queues
+        logger.info("Stopping background cleanup worker...")
+        events_cleanup_worker.stop()
+
+        logger.info("Stopping YOLO process...")
         if yolo_stop_event is not None:
             yolo_stop_event.set()
 
         if yolo_process is not None and yolo_process.is_alive():
-            print("[System] Terminating YOLO process...", flush=True)
-            yolo_process.join(timeout=0.5)
+            yolo_process.join(timeout=1.5)
+
             if yolo_process.is_alive():
+                logger.warning("YOLO process did not exit gracefully. Terminating...")
                 yolo_process.terminate()
-                try:
-                    yolo_process.kill()
-                except Exception:
-                    pass
+                yolo_process.join(timeout=1.0)
 
-        if yolo_input_queue is not None:
-            yolo_input_queue.close()
-            yolo_input_queue.cancel_join_thread()
+        # Release IPC queues to avoid feeder thread deadlocks
+        if input_queue is not None:
+            input_queue.close()
+            input_queue.cancel_join_thread()
 
-        if yolo_output_queue is not None:
-            yolo_output_queue.close()
-            yolo_output_queue.cancel_join_thread()
+        if output_queue is not None:
+            output_queue.close()
+            output_queue.cancel_join_thread()
 
-        # 4. Release Shared Memory Block allocations
-        if shm_buffer is not None:
-            print("[System] Unlinking Shared Memory allocations...", flush=True)
-            try:
-                shm_buffer.close()
-                shm_buffer.unlink()
-            except Exception:
-                pass
+        logger.info("Stopping camera worker threads...")
+        for camera in active_cameras.values():
+            camera.stop()
 
-        # 5. Destroy OpenCV GUI windows
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-
-        print("[System] Cleanup complete. Terminating process tree.", flush=True)
-        force_kill_self()
+        logger.info("All camera components stopped clean.")
+        force_kill_all_processes()
 
 
 if __name__ == "__main__":
-    print("[System] Setting multiprocessing start method to 'spawn'...")
-    mp.set_start_method("spawn", force=True)
-
     main()

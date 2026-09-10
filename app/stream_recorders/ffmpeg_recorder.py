@@ -1,11 +1,14 @@
+import logging
 import os
+import signal
 import subprocess
 from datetime import datetime
-from pathlib import Path
-from app.settings import settings
+from app.core.settings import settings
+
+logger = logging.getLogger("ffmpeg_recorder")
 
 
-class NativeFFmpegRecorder:
+class FFmpegRecorder:
 
     def __init__(self, camera_id: str, rtsp_url: str):
         self.camera_id = camera_id
@@ -14,7 +17,7 @@ class NativeFFmpegRecorder:
         self._current_file_hour: int | None = None
 
     def start_recording(self) -> bool:
-        """Starts raw RTSP stream dumping to MP4 file organized by date and camera folders."""
+        """Starts raw RTSP stream dumping to MKV file organized by date and camera folders."""
         if self.is_recording():
             return False
 
@@ -26,7 +29,6 @@ class NativeFFmpegRecorder:
         cam_dir = settings.EVENTS_DIR / date_str / self.camera_id
         cam_dir.mkdir(parents=True, exist_ok=True)
 
-        # File name is just the starting hour (e.g., 19.mkv or 19-00.mkv)
         output_file = str(cam_dir / f"{now:%Y-%m-%d %H-00}.mkv")
 
         # Stable raw stream copy command via UDP
@@ -48,23 +50,26 @@ class NativeFFmpegRecorder:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            print(f"[Recorder:{self.camera_id}] Raw recording started: {output_file}", flush=True)
+            logger.info("[Recorder:%s] Raw recording started: %s", self.camera_id, output_file)
             return True
         except Exception as exc:
-            print(f"[Recorder:{self.camera_id}] Failed to start FFmpeg: {exc}", flush=True)
+            logger.error("[Recorder:%s] Failed to start FFmpeg process: %s", self.camera_id, exc, exc_info=True)
             self.process = None
             self._current_file_hour = None
             return False
 
     def stop_recording(self) -> None:
-        """Guarantees process tree termination across platforms."""
+        """Guarantees clean process termination and flushes video containers."""
         if self.process is None:
             return
+
+        logger.info("[Recorder:%s] Stopping FFmpeg process (PID %d)...", self.camera_id, self.process.pid)
 
         try:
             pid = self.process.pid
 
             if os.name == "nt":
+                # Windows taskkill allows processes to close clean with /T
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL,
@@ -72,12 +77,18 @@ class NativeFFmpegRecorder:
                     check=False,
                 )
             else:
-                self.process.kill()
+                # POSIX: Send SIGINT first so FFmpeg can write file trailers cleanly
+                self.process.send_signal(signal.SIGINT)
+                try:
+                    self.process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    logger.warning("[Recorder:%s] FFmpeg did not stop on SIGINT, sending SIGKILL...", self.camera_id)
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
 
-            self.process.wait(timeout=2)
-            print(f"[Recorder:{self.camera_id}] Recording stopped.", flush=True)
+            logger.info("[Recorder:%s] Recording stopped cleanly.", self.camera_id)
         except Exception as exc:
-            print(f"[Recorder:{self.camera_id}] Error stopping process: {exc}", flush=True)
+            logger.error("[Recorder:%s] Error stopping FFmpeg process: %s", self.camera_id, exc)
         finally:
             self.process = None
             self._current_file_hour = None
@@ -89,7 +100,7 @@ class NativeFFmpegRecorder:
 
         return_code = self.process.poll()
         if return_code is not None:
-            print(f"[Recorder:{self.camera_id}] FFmpeg exited with code {return_code}", flush=True)
+            logger.warning("[Recorder:%s] FFmpeg process exited unexpectedly with code %d", self.camera_id, return_code)
             self.process = None
             self._current_file_hour = None
             return False
@@ -103,6 +114,6 @@ class NativeFFmpegRecorder:
 
         now_hour = datetime.now().hour
         if self._current_file_hour is not None and now_hour != self._current_file_hour:
-            print(f"[Recorder:{self.camera_id}] Rotating file for new hour ({now_hour}:00)...", flush=True)
+            logger.info("[Recorder:%s] Rotating recording file for new hour (%02d:00)...", self.camera_id, now_hour)
             self.stop_recording()
             self.start_recording()

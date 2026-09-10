@@ -4,7 +4,7 @@ import signal
 import subprocess
 
 
-def force_kill_self():
+def force_kill_all_processes():
     """
     Forces immediate and hard termination of the process and all its child processes.
     Works reliably on both Windows and Linux/macOS.

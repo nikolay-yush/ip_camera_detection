@@ -1,8 +1,8 @@
 import os
-import sys
+
 
 def silence_c_libraries_safe():
-    """Safely redirects C-level stderr (descriptor 2) to devnull 
+    """Prevent loop printing. Safely redirects C-level stderr (descriptor 2) to devnull 
     without blocking execution or crashing on non-standard I/O.
     """
     try:
